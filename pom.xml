@@ -45,10 +45,10 @@ under the License.
 
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-		<flink.version>1.16-SNAPSHOT</flink.version>
+		<flink.version>1.16.3</flink.version>
 		<flink.shaded.version>15.0</flink.shaded.version>
 		<netty.tcnative.version>2.0.44.Final</netty.tcnative.version>
-		<java.version>1.8</java.version>
+		<java.version>11</java.version>
 		<scala.binary.version>2.12</scala.binary.version>
 		<maven.compiler.source>${java.version}</maven.compiler.source>
 		<maven.compiler.target>${java.version}</maven.compiler.target>
@@ -62,7 +62,7 @@ under the License.
 		<maven.compiler.version>3.1</maven.compiler.version>
 		<chill.version>0.7.6</chill.version>
 		<thrift.version>0.13.0</thrift.version>
-		<protobuf.version>3.11.4</protobuf.version>
+		<protobuf.version>3.21.7</protobuf.version>
 		<netty-tcnative.flavor>dynamic</netty-tcnative.flavor>
 		<benchmarkExcludes>org.apache.flink.benchmark.full.*,org.apache.flink.state.benchmark.*,org.apache.flink.scheduler.benchmark.*</benchmarkExcludes>
 		<benchmarks>.*</benchmarks>
@@ -147,6 +147,13 @@ under the License.
 			<artifactId>flink-statebackend-rocksdb</artifactId>
 			<version>${flink.version}</version>
 			<type>test-jar</type>
+		</dependency>
+
+		<!-- OmniStateStore (Falcon) optimization plugin -->
+		<dependency>
+			<groupId>com.huawei</groupId>
+			<artifactId>Falcon</artifactId>
+			<version>1.0</version>
 		</dependency>
 
 		<dependency>
@@ -454,7 +461,7 @@ under the License.
 				<executions>
 					<execution>
 						<id>scala-compile-first</id>
-						<phase>process-resources</phase>
+						<phase>none</phase>
 						<goals>
 							<goal>add-source</goal>
 							<goal>compile</goal>
@@ -462,7 +469,7 @@ under the License.
 					</execution>
 					<execution>
 						<id>scala-test-compile</id>
-						<phase>process-test-resources</phase>
+						<phase>none</phase>
 						<goals>
 							<goal>testCompile</goal>
 						</goals>
