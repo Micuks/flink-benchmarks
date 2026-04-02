@@ -19,6 +19,10 @@
 package org.apache.flink.benchmark;
 
 import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.GlobalConfiguration;
+import org.apache.flink.configuration.MemorySize;
+import org.apache.flink.contrib.streaming.state.RocksDBOptions;
 import org.apache.flink.contrib.streaming.state.RocksDBStateBackend;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
@@ -307,18 +311,23 @@ public class KryoStateBenchmark extends BenchmarkBase {
     //  Context
     // -------------------------------------------------------------------------
 
-    public enum SerMode {
-        /** Default Kryo: unregistered types, reference tracking enabled. */
-        KRYO_DEFAULT,
-        /** Kryo with types registered: avoids class name serialization. */
-        KRYO_REGISTERED
+    public enum BackendMode {
+        /** Vanilla RocksDB with default Kryo (unregistered, reference tracking on). */
+        ROCKS,
+        /** Vanilla RocksDB with Kryo types registered. */
+        ROCKS_KRYO_REG,
+        /**
+         * OmniStateStore (Falcon) with Kryo types registered + RocksDB write buffer tuning.
+         * Requires flink-alg-falcon.jar on classpath.
+         */
+        FALCON
     }
 
     @State(Thread)
     public static class KryoStateContext extends FlinkEnvironmentContext {
 
-        @Param({"KRYO_DEFAULT", "KRYO_REGISTERED"})
-        public SerMode serMode = SerMode.KRYO_DEFAULT;
+        @Param({"ROCKS", "ROCKS_KRYO_REG", "FALCON"})
+        public BackendMode backendMode = BackendMode.ROCKS;
 
         public final int numberOfKeys = 1000;
         public DataStreamSource<MapRecord> mapSource;
@@ -331,10 +340,23 @@ public class KryoStateBenchmark extends BenchmarkBase {
             super.setUp();
 
             String checkpointUri = "file://" + checkpointDir.getAbsolutePath();
-            env.setStateBackend(new RocksDBStateBackend(checkpointUri, false));
+            RocksDBStateBackend rocksBackend = new RocksDBStateBackend(checkpointUri, false);
+
+            if (backendMode == BackendMode.FALCON) {
+                // Falcon reads config via GlobalConfiguration.loadConfiguration()
+                // which reads from flink-conf.yaml. In JMH/MiniCluster there's no
+                // flink-conf.yaml, so we inject config via system properties that
+                // GlobalConfiguration picks up from the conf dir.
+                // Alternative: set the options factory directly via API.
+                rocksBackend.setRocksDBOptions(
+                        new com.huawei.falcon.state.RocksDBOptOptionsFactory());
+            }
+
+            env.setStateBackend(rocksBackend);
             env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
 
-            if (serMode == SerMode.KRYO_REGISTERED) {
+            // Kryo type registration for ROCKS_KRYO_REG and FALCON modes
+            if (backendMode == BackendMode.ROCKS_KRYO_REG || backendMode == BackendMode.FALCON) {
                 env.getConfig().registerKryoType(HashMap.class);
                 env.getConfig().registerKryoType(MapRecord.class);
                 env.getConfig().registerKryoType(SimpleRecord.class);
@@ -342,6 +364,32 @@ public class KryoStateBenchmark extends BenchmarkBase {
 
             mapSource = env.addSource(new MapRecordSource(numberOfKeys, RECORDS_PER_INVOCATION));
             simpleSource = env.addSource(new SimpleRecordSource(numberOfKeys, RECORDS_PER_INVOCATION));
+        }
+
+        @Override
+        protected Configuration createConfiguration() {
+            Configuration configuration = super.createConfiguration();
+            configuration.set(
+                    RocksDBOptions.FIX_PER_SLOT_MEMORY_SIZE, MemorySize.parse("322122552b"));
+
+            if (backendMode == BackendMode.FALCON) {
+                // Falcon config — these are read by RocksDBOptOptionsFactory via
+                // GlobalConfiguration, but we also set them here so that Flink's
+                // own RocksDB config layer sees them.
+                configuration.setString(
+                        "state.backend.rocksdb.options-factory",
+                        "com.huawei.falcon.state.RocksDBOptOptionsFactory");
+                configuration.setString(
+                        "state.backend.rocksdb.falcon.use-partition-filter", "true");
+                configuration.setString(
+                        "state.backend.rocksdb.falcon.write-buffer-size", "128mb");
+                configuration.setString(
+                        "state.backend.rocksdb.falcon.max-write-buffer-number", "4");
+                configuration.setString(
+                        "state.backend.rocksdb.falcon.min-write-buffer-number-to-merge", "2");
+            }
+
+            return configuration;
         }
 
         @Override
