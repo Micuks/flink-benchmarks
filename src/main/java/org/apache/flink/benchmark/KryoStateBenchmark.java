@@ -320,13 +320,15 @@ public class KryoStateBenchmark extends BenchmarkBase {
          * OmniStateStore (Falcon) with Kryo types registered + RocksDB write buffer tuning.
          * Requires flink-alg-falcon.jar on classpath.
          */
-        FALCON
+        FALCON,
+        /** Falcon + ValueState cache enabled. Requires libfalcon.so via java.library.path. */
+        FALCON_CACHE
     }
 
     @State(Thread)
     public static class KryoStateContext extends FlinkEnvironmentContext {
 
-        @Param({"ROCKS", "ROCKS_KRYO_REG", "FALCON"})
+        @Param({"ROCKS", "ROCKS_KRYO_REG", "FALCON", "FALCON_CACHE"})
         public BackendMode backendMode = BackendMode.ROCKS;
 
         public final int numberOfKeys = 1000;
@@ -342,12 +344,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
             String checkpointUri = "file://" + checkpointDir.getAbsolutePath();
             RocksDBStateBackend rocksBackend = new RocksDBStateBackend(checkpointUri, false);
 
-            if (backendMode == BackendMode.FALCON) {
-                // Falcon reads config via GlobalConfiguration.loadConfiguration()
-                // which reads from flink-conf.yaml. In JMH/MiniCluster there's no
-                // flink-conf.yaml, so we inject config via system properties that
-                // GlobalConfiguration picks up from the conf dir.
-                // Alternative: set the options factory directly via API.
+            if (backendMode == BackendMode.FALCON || backendMode == BackendMode.FALCON_CACHE) {
                 rocksBackend.setRocksDBOptions(
                         new com.huawei.falcon.state.RocksDBOptOptionsFactory());
             }
@@ -355,8 +352,8 @@ public class KryoStateBenchmark extends BenchmarkBase {
             env.setStateBackend(rocksBackend);
             env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
 
-            // Kryo type registration for ROCKS_KRYO_REG and FALCON modes
-            if (backendMode == BackendMode.ROCKS_KRYO_REG || backendMode == BackendMode.FALCON) {
+            // Kryo type registration for non-baseline modes
+            if (backendMode != BackendMode.ROCKS) {
                 env.getConfig().registerKryoType(HashMap.class);
                 env.getConfig().registerKryoType(MapRecord.class);
                 env.getConfig().registerKryoType(SimpleRecord.class);
@@ -372,21 +369,31 @@ public class KryoStateBenchmark extends BenchmarkBase {
             configuration.set(
                     RocksDBOptions.FIX_PER_SLOT_MEMORY_SIZE, MemorySize.parse("322122552b"));
 
-            if (backendMode == BackendMode.FALCON) {
-                // Falcon config — these are read by RocksDBOptOptionsFactory via
-                // GlobalConfiguration, but we also set them here so that Flink's
-                // own RocksDB config layer sees them.
+            if (backendMode == BackendMode.FALCON || backendMode == BackendMode.FALCON_CACHE) {
                 configuration.setString(
                         "state.backend.rocksdb.options-factory",
                         "com.huawei.falcon.state.RocksDBOptOptionsFactory");
                 configuration.setString(
                         "state.backend.rocksdb.falcon.use-partition-filter", "true");
                 configuration.setString(
-                        "state.backend.rocksdb.falcon.write-buffer-size", "128mb");
+                        "state.backend.rocksdb.falcon.use-range-filter", "true");
                 configuration.setString(
-                        "state.backend.rocksdb.falcon.max-write-buffer-number", "4");
+                        "state.backend.rocksdb.falcon.use-hash-memtable", "true");
                 configuration.setString(
-                        "state.backend.rocksdb.falcon.min-write-buffer-number-to-merge", "2");
+                        "state.backend.rocksdb.falcon.use-merge", "true");
+                configuration.setString(
+                        "state.backend.rocksdb.falcon.prefix-extractor.length", "13");
+            }
+            if (backendMode == BackendMode.FALCON_CACHE) {
+                configuration.setString(
+                        "state.backend.rocksdb.falcon.use-state-cache", "true");
+                configuration.setString(
+                        "state.backend.rocksdb.falcon.state-cache-sizeLimit", "20000");
+                configuration.setString(
+                        "state.backend.rocksdb.falcon.state-cache-bypass-hitRatio", "0.2");
+            } else if (backendMode == BackendMode.FALCON) {
+                configuration.setString(
+                        "state.backend.rocksdb.falcon.use-state-cache", "false");
             }
 
             return configuration;
