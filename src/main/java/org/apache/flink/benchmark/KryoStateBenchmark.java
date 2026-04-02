@@ -18,15 +18,18 @@
 
 package org.apache.flink.benchmark;
 
-import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.contrib.streaming.state.RocksDBStateBackend;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
+import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
+import org.apache.flink.util.Collector;
 import org.apache.flink.util.FileUtils;
 
 import org.openjdk.jmh.annotations.Benchmark;
@@ -46,25 +49,40 @@ import java.nio.file.Files;
 import java.util.HashMap;
 import java.util.Map;
 
-import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
-
 import static org.openjdk.jmh.annotations.Scope.Thread;
 
 /**
- * Benchmark for Window + RocksDB with POJO state containing Map fields.
+ * Benchmark reproducing the flame graph hotspot: WindowOperator + RocksDB ListState
+ * with POJO values containing Map fields that trigger Kryo serialization.
  *
- * <p>This reproduces the flame graph hotspot where Kryo's MapSerializer dominates CPU
- * (~55%) due to PojoSerializer falling back to KryoSerializer for java.util.Map fields.
+ * <h3>Flame graph call stack reproduced:</h3>
+ * <pre>
+ *   WindowOperator.processElement
+ *     → ListState.add(element)                         // each incoming record
+ *       → RocksDBListState.add()
+ *         → AbstractRocksDBState.serializeValue()      // LEFT branch (~55% CPU)
+ *           → PojoSerializer.serialize()
+ *             → KryoSerializer.serialize() (for Map field)
+ *               → Kryo.writeClassAndObject()
+ *                 → MapSerializer.write()
+ *                   → MapReferenceResolver / identityHashCode
+ *         → RocksDB.merge()                            // RIGHT branch (~25% CPU)
+ *           → DBImpl::WriteImpl → MemTable::Add
+ * </pre>
  *
- * <p>The benchmark compares three serialization modes:
+ * <p>Key insight: {@code .process(ProcessWindowFunction)} makes WindowOperator use
+ * <b>ListState</b> internally (not ReducingState or AggregatingState). ListState.add()
+ * calls {@code RocksDB.merge()} after serializing each element, which is exactly what
+ * the flame graph shows.
+ *
+ * <p>Benchmarks:
  * <ul>
- *   <li>KRYO_DEFAULT: unregistered Kryo (writes full class names + reference tracking)</li>
- *   <li>KRYO_REGISTERED: registered types (avoids class name overhead)</li>
- *   <li>REDUCE_SIMPLE: same workload but simple value type (no Map), as a control</li>
+ *   <li>{@code windowProcessMapPojo}: ListState + MapRecord (triggers Kryo) — reproduces hotspot</li>
+ *   <li>{@code windowProcessSimple}: ListState + SimpleRecord (no Kryo) — control</li>
+ *   <li>{@code windowReduceMapPojo}: ReducingState + MapRecord — comparison (read-modify-write, no merge)</li>
  * </ul>
  *
- * <p>All modes run single-threaded (parallelism=1) on a MiniCluster for single-core measurement.
- * Use {@code taskset -c 0} for CPU pinning if needed.
+ * <p>All benchmarks run at parallelism=1 for single-core measurement.
  */
 @OperationsPerInvocation(value = KryoStateBenchmark.RECORDS_PER_INVOCATION)
 public class KryoStateBenchmark extends BenchmarkBase {
@@ -86,44 +104,70 @@ public class KryoStateBenchmark extends BenchmarkBase {
     // -------------------------------------------------------------------------
 
     /**
-     * Window aggregate with POJO accumulator containing Map field.
-     * This exercises the PojoSerializer -> KryoSerializer -> MapSerializer path.
+     * PRIMARY BENCHMARK: Window + ProcessWindowFunction → ListState internally.
+     *
+     * <p>Each incoming MapRecord is serialized via PojoSerializer→Kryo and written
+     * to RocksDB via merge(). This is the exact path shown in the flame graph.
      */
     @Benchmark
-    public void windowAggregateWithMapState(KryoStateContext context) throws Exception {
-        StreamExecutionEnvironment env = context.env;
-
+    public void windowProcessMapPojo(KryoStateContext context) throws Exception {
         context.mapSource
                 .keyBy(r -> r.key)
                 .window(TumblingEventTimeWindows.of(Time.seconds(10_000)))
-                .aggregate(new MapAccumulatorAggregateFunction())
+                .process(new SumProcessFunction<MapRecord>() {
+                    @Override
+                    protected long extractValue(MapRecord r) {
+                        return r.value;
+                    }
+                })
                 .addSink(new DiscardingSink<>());
 
-        env.execute();
+        context.env.execute();
     }
 
     /**
-     * Window reduce with simple POJO (int + long). Control benchmark without Kryo.
+     * CONTROL: Window + ProcessWindowFunction → ListState, but with SimpleRecord
+     * (no Map field, no Kryo fallback). Shows the cost without Kryo overhead.
      */
     @Benchmark
-    public void windowReduceSimple(KryoStateContext context) throws Exception {
-        StreamExecutionEnvironment env = context.env;
-
+    public void windowProcessSimple(KryoStateContext context) throws Exception {
         context.simpleSource
                 .keyBy(r -> r.key)
                 .window(TumblingEventTimeWindows.of(Time.seconds(10_000)))
-                .reduce(new SimpleReduceFunction())
+                .process(new SumProcessFunction<SimpleRecord>() {
+                    @Override
+                    protected long extractValue(SimpleRecord r) {
+                        return r.value;
+                    }
+                })
                 .addSink(new DiscardingSink<>());
 
-        env.execute();
+        context.env.execute();
+    }
+
+    /**
+     * COMPARISON: Window + reduce() → ReducingState internally.
+     * Uses read-modify-write (get + reduce + put) instead of merge().
+     * Included to measure the difference between ListState(merge) vs ReducingState(get+put).
+     */
+    @Benchmark
+    public void windowReduceMapPojo(KryoStateContext context) throws Exception {
+        context.mapSource
+                .keyBy(r -> r.key)
+                .window(TumblingEventTimeWindows.of(Time.seconds(10_000)))
+                .reduce(new MapRecordReduceFunction())
+                .addSink(new DiscardingSink<>());
+
+        context.env.execute();
     }
 
     // -------------------------------------------------------------------------
     //  Data types
     // -------------------------------------------------------------------------
 
-    /** Record with a Map field — triggers Kryo MapSerializer when used as state. */
+    /** Record with a Map field — triggers Kryo MapSerializer when serialized as state. */
     public static class MapRecord implements Serializable {
+        private static final long serialVersionUID = 1L;
         public int key;
         public long value;
         public Map<String, Long> counters;
@@ -139,8 +183,9 @@ public class KryoStateBenchmark extends BenchmarkBase {
         }
     }
 
-    /** Simple record — no Kryo fallback, used as control. */
+    /** Simple record without Map — no Kryo fallback, used as control. */
     public static class SimpleRecord implements Serializable {
+        private static final long serialVersionUID = 1L;
         public int key;
         public long value;
 
@@ -152,57 +197,40 @@ public class KryoStateBenchmark extends BenchmarkBase {
         }
     }
 
-    /** Accumulator POJO with a Map field — the core of the Kryo hotspot. */
-    public static class MapAccumulator implements Serializable {
-        public long count;
-        public double sum;
-        public Map<String, Long> groupCounts;
-
-        public MapAccumulator() {
-            this.groupCounts = new HashMap<>();
-        }
-    }
-
     // -------------------------------------------------------------------------
     //  Functions
     // -------------------------------------------------------------------------
 
-    /** Aggregate function whose accumulator is a POJO with Map — triggers Kryo. */
-    public static class MapAccumulatorAggregateFunction
-            implements AggregateFunction<MapRecord, MapAccumulator, Long> {
+    /**
+     * ProcessWindowFunction that sums values. Using process() forces WindowOperator
+     * to use ListState (collects all elements, fires on window trigger).
+     */
+    public abstract static class SumProcessFunction<T>
+            extends ProcessWindowFunction<T, Long, Integer, TimeWindow> {
+
+        protected abstract long extractValue(T element);
 
         @Override
-        public MapAccumulator createAccumulator() {
-            return new MapAccumulator();
-        }
-
-        @Override
-        public MapAccumulator add(MapRecord value, MapAccumulator acc) {
-            acc.count++;
-            acc.sum += value.value;
-            String group = "g" + (value.key % 10);
-            acc.groupCounts.merge(group, 1L, Long::sum);
-            return acc;
-        }
-
-        @Override
-        public Long getResult(MapAccumulator acc) {
-            return acc.count;
-        }
-
-        @Override
-        public MapAccumulator merge(MapAccumulator a, MapAccumulator b) {
-            a.count += b.count;
-            a.sum += b.sum;
-            b.groupCounts.forEach((k, v) -> a.groupCounts.merge(k, v, Long::sum));
-            return a;
+        public void process(
+                Integer key,
+                ProcessWindowFunction<T, Long, Integer, TimeWindow>.Context context,
+                Iterable<T> elements,
+                Collector<Long> out) {
+            long sum = 0;
+            for (T element : elements) {
+                sum += extractValue(element);
+            }
+            out.collect(sum);
         }
     }
 
-    public static class SimpleReduceFunction implements ReduceFunction<SimpleRecord> {
+    /** Reduce function for MapRecord — for the ReducingState comparison benchmark. */
+    public static class MapRecordReduceFunction implements ReduceFunction<MapRecord> {
         @Override
-        public SimpleRecord reduce(SimpleRecord v1, SimpleRecord v2) {
-            return new SimpleRecord(v1.key, v1.value + v2.value);
+        public MapRecord reduce(MapRecord v1, MapRecord v2) {
+            Map<String, Long> merged = new HashMap<>(v1.counters);
+            v2.counters.forEach((k, v) -> merged.merge(k, v, Long::sum));
+            return new MapRecord(v1.key, v1.value + v2.value, merged);
         }
     }
 
@@ -309,7 +337,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
             if (serMode == SerMode.KRYO_REGISTERED) {
                 env.getConfig().registerKryoType(HashMap.class);
                 env.getConfig().registerKryoType(MapRecord.class);
-                env.getConfig().registerKryoType(MapAccumulator.class);
+                env.getConfig().registerKryoType(SimpleRecord.class);
             }
 
             mapSource = env.addSource(new MapRecordSource(numberOfKeys, RECORDS_PER_INVOCATION));
