@@ -64,27 +64,23 @@ import static org.openjdk.jmh.annotations.Scope.Thread;
  *   WindowOperator.processElement
  *     → ListState.add(element)                         // each incoming record
  *       → RocksDBListState.add()
- *         → AbstractRocksDBState.serializeValue()      // LEFT branch (~55% CPU)
+ *         → AbstractRocksDBState.serializeValue()      // serialize branch
  *           → PojoSerializer.serialize()
  *             → KryoSerializer.serialize() (for Map field)
  *               → Kryo.writeClassAndObject()
  *                 → MapSerializer.write()
  *                   → MapReferenceResolver / identityHashCode
- *         → RocksDB.merge()                            // RIGHT branch (~25% CPU)
- *           → DBImpl::WriteImpl → MemTable::Add
+ *         → RocksDB.merge()                            // write branch
+ *
+ *     → (on window fire) ListState.get()               // read branch
+ *       → RocksDB.get() + full deserialization
  * </pre>
  *
- * <p>Key insight: {@code .process(ProcessWindowFunction)} makes WindowOperator use
- * <b>ListState</b> internally (not ReducingState or AggregatingState). ListState.add()
- * calls {@code RocksDB.merge()} after serializing each element, which is exactly what
- * the flame graph shows.
- *
- * <p>Benchmarks:
- * <ul>
- *   <li>{@code windowProcessMapPojo}: ListState + MapRecord (triggers Kryo) — reproduces hotspot</li>
- *   <li>{@code windowProcessSimple}: ListState + SimpleRecord (no Kryo) — control</li>
- *   <li>{@code windowReduceMapPojo}: ReducingState + MapRecord — comparison (read-modify-write, no merge)</li>
- * </ul>
+ * <h3>Window sizing for balanced read/write:</h3>
+ * <p>Windows are sized to fire frequently during the benchmark run, so that both
+ * the write path (merge per record) and read path (get on window fire) appear in
+ * the flame graph. With 1M records, 1000 keys, timestamps 0..999999ms (~1000s),
+ * and a 10-second window: ~100 window firings, each reading back ~10 elements per key.
  *
  * <p>All benchmarks run at parallelism=1 for single-core measurement.
  */
@@ -117,7 +113,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
     public void windowProcessMapPojo(KryoStateContext context) throws Exception {
         context.mapSource
                 .keyBy(r -> r.key)
-                .window(TumblingEventTimeWindows.of(Time.seconds(10_000)))
+                .window(TumblingEventTimeWindows.of(Time.seconds(10)))
                 .process(new SumProcessFunction<MapRecord>() {
                     @Override
                     protected long extractValue(MapRecord r) {
@@ -137,7 +133,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
     public void windowProcessSimple(KryoStateContext context) throws Exception {
         context.simpleSource
                 .keyBy(r -> r.key)
-                .window(TumblingEventTimeWindows.of(Time.seconds(10_000)))
+                .window(TumblingEventTimeWindows.of(Time.seconds(10)))
                 .process(new SumProcessFunction<SimpleRecord>() {
                     @Override
                     protected long extractValue(SimpleRecord r) {
@@ -158,7 +154,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
     public void windowReduceMapPojo(KryoStateContext context) throws Exception {
         context.mapSource
                 .keyBy(r -> r.key)
-                .window(TumblingEventTimeWindows.of(Time.seconds(10_000)))
+                .window(TumblingEventTimeWindows.of(Time.seconds(10)))
                 .reduce(new MapRecordReduceFunction())
                 .addSink(new DiscardingSink<>());
 
@@ -254,14 +250,18 @@ public class KryoStateBenchmark extends BenchmarkBase {
             this.numEvents = numEvents;
         }
 
+        /** Number of entries per Map — controls Kryo serialization weight. */
+        private static final int MAP_ENTRIES = 20;
+
         @Override
         public void run(SourceContext<MapRecord> ctx) {
             long counter = 0;
             while (running && counter < numEvents) {
                 int keyId = (int) (counter % numKeys);
-                Map<String, Long> counters = new HashMap<>(4);
-                counters.put("a", (long) keyId);
-                counters.put("b", (long) keyId * 2);
+                Map<String, Long> counters = new HashMap<>(MAP_ENTRIES * 2);
+                for (int i = 0; i < MAP_ENTRIES; i++) {
+                    counters.put("field_" + i, counter + i);
+                }
                 synchronized (ctx.getCheckpointLock()) {
                     ctx.collectWithTimestamp(
                             new MapRecord(keyId, counter, counters), counter);
