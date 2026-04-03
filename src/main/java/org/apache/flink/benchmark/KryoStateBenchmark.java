@@ -24,13 +24,11 @@ import org.apache.flink.configuration.GlobalConfiguration;
 import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.contrib.streaming.state.RocksDBOptions;
 import org.apache.flink.contrib.streaming.state.RocksDBStateBackend;
-import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
-import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
@@ -76,11 +74,16 @@ import static org.openjdk.jmh.annotations.Scope.Thread;
  *       → RocksDB.get() + full deserialization
  * </pre>
  *
- * <h3>Window sizing for balanced read/write:</h3>
- * <p>Windows are sized to fire frequently during the benchmark run, so that both
- * the write path (merge per record) and read path (get on window fire) appear in
- * the flame graph. With 1M records, 1000 keys, timestamps 0..999999ms (~1000s),
- * and a 10-second window: ~100 window firings, each reading back ~10 elements per key.
+ * <h3>Two distinct flame graph stacks (matching production profile):</h3>
+ * <p><b>Stack 1 — write path</b> (from {@code StreamInputProcessor.processInput}):
+ * <br>{@code WindowOperator.processElement → ListState.add → serializeValue + RocksDB.merge}
+ * <p><b>Stack 2 — read path</b> (from {@code MailboxProcessor.processMailsNonBlocking}):
+ * <br>{@code WindowOperator.onProcessingTime → RocksDBListState.getInternal → RocksDB.get
+ *   + ListDelimitedSerializer.deserializeList → PojoSerializer.deserialize → Kryo}
+ *
+ * <p>Using <b>Processing Time Windows</b> (not Event Time) so that window triggers
+ * fire via internal timer callbacks ({@code onProcessingTime}), exactly matching
+ * the production flame graph. 5-second windows ensure multiple firings per run.
  *
  * <p>All benchmarks run at parallelism=1 for single-core measurement.
  */
@@ -113,7 +116,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
     public void windowProcessMapPojo(KryoStateContext context) throws Exception {
         context.mapSource
                 .keyBy(r -> r.key)
-                .window(TumblingEventTimeWindows.of(Time.seconds(10)))
+                .window(TumblingProcessingTimeWindows.of(Time.seconds(5)))
                 .process(new SumProcessFunction<MapRecord>() {
                     @Override
                     protected long extractValue(MapRecord r) {
@@ -133,7 +136,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
     public void windowProcessSimple(KryoStateContext context) throws Exception {
         context.simpleSource
                 .keyBy(r -> r.key)
-                .window(TumblingEventTimeWindows.of(Time.seconds(10)))
+                .window(TumblingProcessingTimeWindows.of(Time.seconds(5)))
                 .process(new SumProcessFunction<SimpleRecord>() {
                     @Override
                     protected long extractValue(SimpleRecord r) {
@@ -154,7 +157,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
     public void windowReduceMapPojo(KryoStateContext context) throws Exception {
         context.mapSource
                 .keyBy(r -> r.key)
-                .window(TumblingEventTimeWindows.of(Time.seconds(10)))
+                .window(TumblingProcessingTimeWindows.of(Time.seconds(5)))
                 .reduce(new MapRecordReduceFunction())
                 .addSink(new DiscardingSink<>());
 
@@ -263,8 +266,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
                     counters.put("field_" + i, counter + i);
                 }
                 synchronized (ctx.getCheckpointLock()) {
-                    ctx.collectWithTimestamp(
-                            new MapRecord(keyId, counter, counters), counter);
+                    ctx.collect(new MapRecord(keyId, counter, counters));
                 }
                 counter++;
             }
@@ -294,8 +296,7 @@ public class KryoStateBenchmark extends BenchmarkBase {
             while (running && counter < numEvents) {
                 int keyId = (int) (counter % numKeys);
                 synchronized (ctx.getCheckpointLock()) {
-                    ctx.collectWithTimestamp(
-                            new SimpleRecord(keyId, counter), counter);
+                    ctx.collect(new SimpleRecord(keyId, counter));
                 }
                 counter++;
             }
@@ -350,7 +351,6 @@ public class KryoStateBenchmark extends BenchmarkBase {
             }
 
             env.setStateBackend(rocksBackend);
-            env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
 
             // Kryo type registration for non-baseline modes
             if (backendMode != BackendMode.ROCKS) {
