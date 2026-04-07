@@ -53,6 +53,11 @@ public final class KryoStateJob {
     private static final int DEFAULT_MAP_ENTRIES = 20;
     private static final int DEFAULT_WINDOW_SECONDS = 5;
     private static final int DEFAULT_THROTTLE_BATCH_SIZE = 4_096;
+    private static final int DEFAULT_MAX_VALUES_PER_KEY = 10;
+    private static final int DEFAULT_LARGE_STATE_GET_EVERY =
+            KryoStateBenchmark.LARGE_STATE_GET_EVERY;
+    private static final int DEFAULT_LARGE_STATE_CLEAR_EVERY =
+            KryoStateBenchmark.LARGE_STATE_CLEAR_EVERY;
 
     private KryoStateJob() {}
 
@@ -68,6 +73,15 @@ public final class KryoStateJob {
         int mapEntries = params.getInt("mapEntries", DEFAULT_MAP_ENTRIES);
         int windowSeconds = params.getInt("windowSeconds", DEFAULT_WINDOW_SECONDS);
         int throttleBatchSize = params.getInt("throttleBatchSize", DEFAULT_THROTTLE_BATCH_SIZE);
+        int maxValuesPerKey =
+                params.getInt(
+                        "maxValuesPerKey",
+                        mode == JobMode.KEYED_LIST_GET_ADD_BALANCED_MAP
+                                ? KryoStateBenchmark.BALANCED_GET_ADD_MAX_VALUES_PER_KEY
+                                : DEFAULT_MAX_VALUES_PER_KEY);
+        int largeStateGetEvery = params.getInt("largeStateGetEvery", DEFAULT_LARGE_STATE_GET_EVERY);
+        int largeStateClearEvery =
+                params.getInt("largeStateClearEvery", DEFAULT_LARGE_STATE_CLEAR_EVERY);
         boolean reuseSourceRecords = params.getBoolean("reuseSourceRecords", false);
         boolean registerKryo = params.getBoolean("registerKryo", false);
 
@@ -84,6 +98,7 @@ public final class KryoStateJob {
         LOG.info(
                 "Starting KryoStateJob mode={}, parallelism={}, sourceParallelism={}, events={}, "
                         + "eventsPerSecond={}, keys={}, mapEntries={}, windowSeconds={}, "
+                        + "maxValuesPerKey={}, largeStateGetEvery={}, largeStateClearEvery={}, "
                         + "reuseSourceRecords={}, registerKryo={}",
                 mode,
                 parallelism,
@@ -93,6 +108,9 @@ public final class KryoStateJob {
                 numberOfKeys,
                 mapEntries,
                 windowSeconds,
+                maxValuesPerKey,
+                largeStateGetEvery,
+                largeStateClearEvery,
                 reuseSourceRecords,
                 registerKryo);
 
@@ -130,6 +148,54 @@ public final class KryoStateJob {
                         windowSeconds,
                         throttleBatchSize,
                         reuseSourceRecords);
+                break;
+            case KEYED_LIST_GET_ADD_MAP:
+                runKeyedListStateGetAddMap(
+                        env,
+                        sourceParallelism,
+                        eventsNum,
+                        eventsPerSecond,
+                        numberOfKeys,
+                        mapEntries,
+                        throttleBatchSize,
+                        reuseSourceRecords,
+                        maxValuesPerKey);
+                break;
+            case KEYED_LIST_GET_ADD_BALANCED_MAP:
+                runKeyedListStateGetAddMap(
+                        env,
+                        sourceParallelism,
+                        eventsNum,
+                        eventsPerSecond,
+                        numberOfKeys,
+                        mapEntries,
+                        throttleBatchSize,
+                        reuseSourceRecords,
+                        maxValuesPerKey,
+                        "keyed-list-state-get-add-balanced-map-pojo");
+                break;
+            case KEYED_LIST_GET_ADD_STATE_PAYLOAD_MAP:
+                runKeyedListStateGetAddStatePayloadMap(
+                        env,
+                        sourceParallelism,
+                        eventsNum,
+                        eventsPerSecond,
+                        numberOfKeys,
+                        mapEntries,
+                        throttleBatchSize,
+                        maxValuesPerKey);
+                break;
+            case KEYED_LIST_LARGE_STATE_MAP:
+                runKeyedListStateLargeStateMap(
+                        env,
+                        sourceParallelism,
+                        eventsNum,
+                        eventsPerSecond,
+                        numberOfKeys,
+                        mapEntries,
+                        throttleBatchSize,
+                        largeStateGetEvery,
+                        largeStateClearEvery);
                 break;
             default:
                 throw new IllegalArgumentException("Unsupported mode: " + mode);
@@ -237,10 +303,129 @@ public final class KryoStateJob {
                 .name("discard");
     }
 
+    private static void runKeyedListStateGetAddMap(
+            StreamExecutionEnvironment env,
+            int sourceParallelism,
+            long eventsNum,
+            long eventsPerSecond,
+            int numberOfKeys,
+            int mapEntries,
+            int throttleBatchSize,
+            boolean reuseSourceRecords,
+            int maxValuesPerKey) {
+        runKeyedListStateGetAddMap(
+                env,
+                sourceParallelism,
+                eventsNum,
+                eventsPerSecond,
+                numberOfKeys,
+                mapEntries,
+                throttleBatchSize,
+                reuseSourceRecords,
+                maxValuesPerKey,
+                "keyed-list-state-get-add-map-pojo");
+    }
+
+    private static void runKeyedListStateGetAddMap(
+            StreamExecutionEnvironment env,
+            int sourceParallelism,
+            long eventsNum,
+            long eventsPerSecond,
+            int numberOfKeys,
+            int mapEntries,
+            int throttleBatchSize,
+            boolean reuseSourceRecords,
+            int maxValuesPerKey,
+            String operatorName) {
+        DataStream<KryoStateBenchmark.MapRecord> source =
+                env.addSource(
+                                new RateLimitedMapRecordSource(
+                                        eventsNum,
+                                        eventsPerSecond,
+                                        throttleBatchSize,
+                                        numberOfKeys,
+                                        mapEntries,
+                                        reuseSourceRecords))
+                        .name("rate-limited-map-record-source")
+                        .setParallelism(sourceParallelism);
+
+        source.keyBy(r -> r.key)
+                .process(
+                        new KryoStateBenchmark.ListStateGetAddProcessFunction(
+                                numberOfKeys, maxValuesPerKey))
+                .name(operatorName)
+                .addSink(new DiscardingSink<>())
+                .name("discard");
+    }
+
+    private static void runKeyedListStateGetAddStatePayloadMap(
+            StreamExecutionEnvironment env,
+            int sourceParallelism,
+            long eventsNum,
+            long eventsPerSecond,
+            int numberOfKeys,
+            int mapEntries,
+            int throttleBatchSize,
+            int maxValuesPerKey) {
+        DataStream<KryoStateBenchmark.SimpleRecord> source =
+                env.addSource(
+                                new RateLimitedSimpleRecordSource(
+                                        eventsNum,
+                                        eventsPerSecond,
+                                        throttleBatchSize,
+                                        numberOfKeys))
+                        .name("rate-limited-simple-record-source")
+                        .setParallelism(sourceParallelism);
+
+        source.keyBy(r -> r.key)
+                .process(
+                        new KryoStateBenchmark.ListStateGetAddStatePayloadProcessFunction(
+                                numberOfKeys, maxValuesPerKey, mapEntries))
+                .name("keyed-list-state-get-add-state-payload-map-pojo")
+                .addSink(new DiscardingSink<>())
+                .name("discard");
+    }
+
+    private static void runKeyedListStateLargeStateMap(
+            StreamExecutionEnvironment env,
+            int sourceParallelism,
+            long eventsNum,
+            long eventsPerSecond,
+            int numberOfKeys,
+            int mapEntries,
+            int throttleBatchSize,
+            int largeStateGetEvery,
+            int largeStateClearEvery) {
+        DataStream<KryoStateBenchmark.SimpleRecord> source =
+                env.addSource(
+                                new RateLimitedSimpleRecordSource(
+                                        eventsNum,
+                                        eventsPerSecond,
+                                        throttleBatchSize,
+                                        numberOfKeys))
+                        .name("rate-limited-simple-record-source")
+                        .setParallelism(sourceParallelism);
+
+        source.keyBy(r -> r.key)
+                .process(
+                        new KryoStateBenchmark.ListStateLargeStateProcessFunction(
+                                numberOfKeys,
+                                mapEntries,
+                                largeStateGetEvery,
+                                largeStateClearEvery))
+                .name("keyed-list-state-large-state-map-pojo")
+                .addSink(new DiscardingSink<>())
+                .name("discard");
+    }
+
     private enum JobMode {
         WINDOW_PROCESS_MAP,
         WINDOW_PROCESS_SIMPLE,
-        WINDOW_REDUCE_MAP;
+        WINDOW_REDUCE_MAP,
+        KEYED_LIST_GET_ADD_MAP,
+        KEYED_LIST_GET_ADD_BALANCED_MAP,
+        KEYED_LIST_GET_ADD_STATE_PAYLOAD_MAP,
+        KEYED_LIST_LARGE_STATE_MAP;
 
         private static JobMode fromString(String value) {
             String normalized = value.trim().replace('-', '_').toUpperCase(Locale.ROOT);
@@ -256,11 +441,40 @@ public final class KryoStateJob {
                 case "WINDOW_REDUCE_MAP":
                 case "WINDOW_REDUCE_MAP_POJO":
                     return WINDOW_REDUCE_MAP;
+                case "GET_ADD":
+                case "KEYED_GET_ADD":
+                case "KEYED_LIST_GET_ADD":
+                case "KEYED_LIST_GET_ADD_MAP":
+                case "KEYED_LIST_GET_ADD_MAP_POJO":
+                    return KEYED_LIST_GET_ADD_MAP;
+                case "GET_ADD_BALANCED":
+                case "BALANCED_GET_ADD":
+                case "KEYED_GET_ADD_BALANCED":
+                case "KEYED_LIST_GET_ADD_BALANCED":
+                case "KEYED_LIST_GET_ADD_BALANCED_MAP":
+                case "KEYED_LIST_GET_ADD_BALANCED_MAP_POJO":
+                    return KEYED_LIST_GET_ADD_BALANCED_MAP;
+                case "GET_ADD_STATE_PAYLOAD":
+                case "STATE_PAYLOAD":
+                case "KEYED_GET_ADD_STATE_PAYLOAD":
+                case "KEYED_LIST_GET_ADD_STATE_PAYLOAD":
+                case "KEYED_LIST_GET_ADD_STATE_PAYLOAD_MAP":
+                case "KEYED_LIST_GET_ADD_STATE_PAYLOAD_MAP_POJO":
+                    return KEYED_LIST_GET_ADD_STATE_PAYLOAD_MAP;
+                case "LARGE_STATE":
+                case "LARGE_STATE_MAP":
+                case "LARGE_STATE_MAP_POJO":
+                case "KEYED_LARGE_STATE":
+                case "KEYED_LIST_LARGE_STATE":
+                case "KEYED_LIST_LARGE_STATE_MAP":
+                case "KEYED_LIST_LARGE_STATE_MAP_POJO":
+                case "GET_ADD_LARGE_STATE":
+                    return KEYED_LIST_LARGE_STATE_MAP;
                 default:
                     throw new IllegalArgumentException(
                             "Unknown mode '"
                                     + value
-                                    + "'. Supported values: map, simple, reduce.");
+                                    + "'. Supported values: map, simple, reduce, get-add, get-add-balanced, get-add-state-payload, large-state.");
             }
         }
     }
