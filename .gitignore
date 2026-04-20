@@ -19,3 +19,5 @@ out/
 *.ipr
 *.iws
 jmh-result*.csv
+repro/*.tar.gz
+repro/*.zip

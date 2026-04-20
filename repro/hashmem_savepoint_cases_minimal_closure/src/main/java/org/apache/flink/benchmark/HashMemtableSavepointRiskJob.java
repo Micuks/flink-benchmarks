@@ -1,12 +1,10 @@
 package org.apache.flink.benchmark;
 
-import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.java.utils.ParameterTool;
-import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
@@ -27,18 +25,19 @@ import java.io.IOException;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
+import java.util.Locale;
 import java.util.concurrent.locks.LockSupport;
 
-public class HashMemtableSavepointProbeJob {
+public class HashMemtableSavepointRiskJob {
 
     public static void main(String[] args) throws Exception {
         ParameterTool params = ParameterTool.fromArgs(args);
+        String mode = params.get("mode", "load").toLowerCase(Locale.ROOT);
         int parallelism = params.getInt("parallelism", 1);
         int sourceParallelism = params.getInt("sourceParallelism", parallelism);
-        long events = params.getLong("events", 40000L);
-        long eventsPerSecond = params.getLong("eventsPerSecond", 400L);
-        int keys = params.getInt("keys", 8);
-        long checkpointIntervalMs = params.getLong("checkpointIntervalMs", 5000L);
+        long keys = params.getLong("keys", 50000L);
+        long eventsPerSecond = params.getLong("eventsPerSecond", 50000L);
+        long checkpointIntervalMs = params.getLong("checkpointIntervalMs", 3600_000L);
         String outputDir = params.getRequired("output");
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -49,52 +48,54 @@ public class HashMemtableSavepointProbeJob {
         env.getConfig().setGlobalJobParameters(params);
 
         DataStream<Event> stream = env
-                .addSource(new DeterministicSource(events, eventsPerSecond, keys))
-                .name("probe-source")
-                .uid("probe-source")
+                .addSource(new PhaseSource(mode, keys, eventsPerSecond))
+                .name("risk-source")
+                .uid("risk-source")
                 .setParallelism(sourceParallelism);
 
         stream
-                .keyBy(e -> e.key)
-                .process(new ProbeProcessFunction())
-                .name("probe-process")
-                .uid("probe-process")
+                .keyBy(event -> event.key)
+                .process(new ValueStateVerifier())
+                .name("risk-process")
+                .uid("risk-process")
                 .addSink(new AppendingSink(outputDir))
-                .name("probe-sink")
-                .uid("probe-sink")
+                .name("risk-sink")
+                .uid("risk-sink")
                 .setParallelism(1);
 
-        env.execute("HashMemtableSavepointProbeJob");
+        env.execute("HashMemtableSavepointRiskJob-" + mode);
     }
 
     public static final class Event implements Serializable {
         public long seq;
-        public int key;
-        public long delta;
+        public String key;
+        public String payload;
+        public boolean verify;
 
         public Event() {}
 
-        public Event(long seq, int key, long delta) {
+        Event(long seq, String key, String payload, boolean verify) {
             this.seq = seq;
             this.key = key;
-            this.delta = delta;
+            this.payload = payload;
+            this.verify = verify;
         }
     }
 
-    public static final class DeterministicSource extends RichParallelSourceFunction<Event>
+    public static final class PhaseSource extends RichParallelSourceFunction<Event>
             implements CheckpointedFunction {
-        private final long totalEvents;
+        private final String mode;
+        private final long keys;
         private final long eventsPerSecond;
-        private final int keys;
 
         private volatile boolean running = true;
         private long nextSeq;
         private transient ListState<Long> checkpointState;
 
-        public DeterministicSource(long totalEvents, long eventsPerSecond, int keys) {
-            this.totalEvents = totalEvents;
-            this.eventsPerSecond = eventsPerSecond;
+        PhaseSource(String mode, long keys, long eventsPerSecond) {
+            this.mode = mode;
             this.keys = keys;
+            this.eventsPerSecond = eventsPerSecond;
         }
 
         @Override
@@ -102,12 +103,11 @@ public class HashMemtableSavepointProbeJob {
             final long intervalNs = eventsPerSecond > 0 ? 1_000_000_000L / eventsPerSecond : 0L;
             long nextDeadline = System.nanoTime();
 
-            while (running && nextSeq < totalEvents) {
-                final long current = nextSeq;
-                final Event event = new Event(current, (int) (current % keys), current + 1);
+            while (running && nextSeq < keys) {
+                Event event = buildEvent(nextSeq, "verify".equals(mode));
                 synchronized (ctx.getCheckpointLock()) {
                     ctx.collect(event);
-                    nextSeq = current + 1;
+                    nextSeq++;
                 }
                 if (intervalNs > 0L) {
                     nextDeadline += intervalNs;
@@ -117,6 +117,20 @@ public class HashMemtableSavepointProbeJob {
                     }
                 }
             }
+
+            if ("load".equals(mode)) {
+                while (running) {
+                    LockSupport.parkNanos(100_000_000L);
+                }
+            }
+        }
+
+        private static Event buildEvent(long seq, boolean verify) {
+            String head = String.format(Locale.ROOT, "%08x", seq);
+            String tail = String.format(Locale.ROOT, "%08x", Integer.reverse((int) seq));
+            String key = head + "-state-key-" + tail + "-abcdefghijklmnop";
+            String payload = "payload-" + head + '-' + tail + "-abcdefghijklmnopqrstuvwxyz-0123456789";
+            return new Event(seq, key, payload, verify);
         }
 
         @Override
@@ -133,7 +147,11 @@ public class HashMemtableSavepointProbeJob {
         @Override
         public void initializeState(FunctionInitializationContext context) throws Exception {
             checkpointState = context.getOperatorStateStore()
-                    .getListState(new ListStateDescriptor<>("next-seq", Long.class));
+                    .getListState(new ListStateDescriptor<>("risk-next-seq", Long.class));
+            if ("verify".equals(mode)) {
+                nextSeq = 0L;
+                return;
+            }
             if (context.isRestored()) {
                 Iterator<Long> it = checkpointState.get().iterator();
                 nextSeq = it.hasNext() ? it.next() : 0L;
@@ -143,35 +161,32 @@ public class HashMemtableSavepointProbeJob {
         }
     }
 
-    public static final class ProbeProcessFunction
-            extends KeyedProcessFunction<Integer, Event, String> {
-        private transient ValueState<Long> sum;
-        private transient ValueState<Long> lastSeq;
-        private transient ValueState<Long> xor;
+    public static final class ValueStateVerifier
+            extends KeyedProcessFunction<String, Event, String> {
+        private transient ValueState<String> state;
 
         @Override
         public void open(Configuration parameters) {
-            sum = getRuntimeContext().getState(new ValueStateDescriptor<>("sum-state", Long.class));
-            lastSeq = getRuntimeContext().getState(new ValueStateDescriptor<>("last-seq-state", Long.class));
-            xor = getRuntimeContext().getState(new ValueStateDescriptor<>("xor-state", Long.class));
+            state = getRuntimeContext().getState(new ValueStateDescriptor<>("risk-payload", String.class));
         }
 
         @Override
         public void processElement(Event value, Context ctx, Collector<String> out) throws Exception {
-            Long curSum = sum.value();
-            Long curXor = xor.value();
-            if (curSum == null) {
-                curSum = 0L;
+            if (!value.verify) {
+                state.update(value.payload);
+                return;
             }
-            if (curXor == null) {
-                curXor = 0L;
+            String actual = state.value();
+            if (!value.payload.equals(actual)) {
+                out.collect(value.seq
+                        + "\t" + value.key
+                        + "\t" + safe(actual)
+                        + "\t" + value.payload);
             }
-            curSum += value.delta;
-            curXor ^= value.delta;
-            sum.update(curSum);
-            lastSeq.update(value.seq);
-            xor.update(curXor);
-            out.collect(value.seq + "\t" + value.key + "\t" + curSum + "\t" + value.seq + "\t" + curXor);
+        }
+
+        private static String safe(String value) {
+            return value == null ? "<null>" : value;
         }
     }
 
@@ -180,7 +195,7 @@ public class HashMemtableSavepointProbeJob {
         private transient BufferedWriter writer;
         private transient int buffered;
 
-        public AppendingSink(String outputDir) {
+        AppendingSink(String outputDir) {
             this.outputDir = outputDir;
         }
 
