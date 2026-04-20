@@ -120,3 +120,13 @@ Good example of how to name benchmark methods are:
 ### Submitting a pull request
 
 Please attach the results of your benchmarks.
+
+## HashMemTable Savepoint Cases
+
+The repository also contains several executable savepoint/recovery workloads for hash memtable investigations:
+
+- `org.apache.flink.benchmark.HashMemtableSavepointRiskJob`
+- `org.apache.flink.benchmark.HashMemtableSavepointRmwRiskJob`
+- `org.apache.flink.benchmark.HashMemtableSavepointMapStateRiskJob`
+
+A concise Chinese note for the workload coverage and the load/savepoint/restore/verify flow lives in [docs/zh/hashmem_savepoint_case_extensions.md](docs/zh/hashmem_savepoint_case_extensions.md).
